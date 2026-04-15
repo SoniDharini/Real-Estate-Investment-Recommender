@@ -618,19 +618,80 @@ def run_recommender(
     return items.sort_values("match_score", ascending=False).head(top_n).reset_index(drop=True)
 
 
+def plottable_numeric_columns(df: pd.DataFrame, cols: List[str], min_valid: int = 2) -> List[str]:
+    """Keep only columns that coerce to finite floats with enough points (uploaded CSVs often mismatch inferred dtypes)."""
+    out: List[str] = []
+    for c in cols:
+        if c not in df.columns:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if s.notna().sum() >= min_valid:
+            out.append(c)
+    return out
+
+
 def fig_histogram(df: pd.DataFrame, col: str, title: str):
-    fig = px.histogram(df, x=col, nbins=30, color_discrete_sequence=[ACCENT])
+    x = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    plot_df = pd.DataFrame({col: x}).dropna(subset=[col])
+    if plot_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No numeric values to plot for this column.",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(color=TEXT),
+        )
+        fig.update_layout(**PLOTLY_LAYOUT, title=title)
+        return fig
+    fig = px.histogram(plot_df, x=col, nbins=30, color_discrete_sequence=[ACCENT])
     fig.update_traces(marker_line_width=0)
     fig.update_layout(**PLOTLY_LAYOUT, title=title)
     return fig
 
 
 def fig_scatter(df: pd.DataFrame, x: str, y: str, color: Optional[str], title: str):
+    d = df[[x, y]].copy()
+    d[x] = pd.to_numeric(d[x], errors="coerce")
+    d[y] = pd.to_numeric(d[y], errors="coerce")
+    d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=[x, y])
+
+    color_col = color if color and color in df.columns and color not in (x, y) else None
+    if color_col is not None:
+        d[color_col] = df.loc[d.index, color_col]
+        # Plotly discrete color: avoid unhashable / mixed types and huge legend spam.
+        nu = d[color_col].nunique(dropna=True)
+        if nu == 0 or nu > 48:
+            color_col = None
+        elif pd.api.types.is_numeric_dtype(d[color_col]):
+            if d[color_col].notna().sum() == 0:
+                color_col = None
+            elif nu <= 12:
+                d[color_col] = d[color_col].astype(str)
+        else:
+            d[color_col] = d[color_col].astype(str)
+
+    if len(d) < 2:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Not enough numeric x/y pairs for a scatter plot (check uploaded columns).",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(color=TEXT),
+        )
+        fig.update_layout(**PLOTLY_LAYOUT, title=title)
+        return fig
+
     fig = px.scatter(
-        df,
+        d,
         x=x,
         y=y,
-        color=color if color and color in df.columns else None,
+        color=color_col,
         color_discrete_sequence=PALETTE,
     )
     fig.update_layout(**PLOTLY_LAYOUT, title=title)
@@ -832,7 +893,7 @@ def main():
 
     with tab3:
         st.markdown('<div class="section-title">Exploratory Analytics</div>', unsafe_allow_html=True)
-        num_cols = [c for c in schema.numeric_cols if c in df.columns]
+        num_cols = plottable_numeric_columns(df, [c for c in schema.numeric_cols if c in df.columns])
         cat_cols = [c for c in schema.categorical_cols if c in df.columns]
 
         if num_cols:

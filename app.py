@@ -147,8 +147,11 @@ class UserPreferences:
     cities: List[str] = field(default_factory=list)
     neighborhoods: List[str] = field(default_factory=list)
     property_types: List[str] = field(default_factory=list)
+    min_sqft: Optional[float] = None
+    max_sqft: Optional[float] = None
     strict_budget: bool = True
     strict_beds: bool = False
+    strict_area: bool = False
 
 
 def snake_case(col: str) -> str:
@@ -438,14 +441,37 @@ def infer_schema(df: pd.DataFrame) -> SchemaInfo:
 
 def extract_sqft_estimate(val: object) -> float:
     """Parse strings like '1085 sqft', '799-1258 sqft' into a single numeric estimate."""
-    if pd.isna(val):
+    try:
+        if val is None:
+            return np.nan
+        if isinstance(val, (bool, np.bool_)):
+            return np.nan
+        if isinstance(val, (int, np.integer)):
+            return float(val)
+        if isinstance(val, (float, np.floating)):
+            if np.isnan(val):
+                return np.nan
+            return float(val)
+        if pd.isna(val):
+            return np.nan
+        s = str(val).lower().replace(",", "").strip()
+        if s in {"", "nan", "none", "<na>", "nat"}:
+            return np.nan
+        nums = re.findall(r"[\d.]+", s)
+        if not nums:
+            return np.nan
+        floats = [float(x) for x in nums]
+        return float(np.median(floats))
+    except (TypeError, ValueError, OverflowError):
         return np.nan
-    s = str(val).lower().replace(",", "")
-    nums = re.findall(r"[\d.]+", s)
-    if not nums:
-        return np.nan
-    floats = [float(x) for x in nums]
-    return float(np.median(floats))
+
+
+def _safe_sqft_series(series: pd.Series) -> pd.Series:
+    """Build numeric sqft column without Series.map (PyArrow string arrays can break .map in pandas 2.x)."""
+    out: List[float] = []
+    for v in series.tolist():
+        out.append(extract_sqft_estimate(v))
+    return pd.Series(out, index=series.index, dtype="float64")
 
 
 def engineer_real_estate_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -459,8 +485,15 @@ def engineer_real_estate_features(df: pd.DataFrame) -> pd.DataFrame:
     elif "url" in df.columns:
         df["listing_title"] = df["url"].astype(str).str.slice(0, 96)
 
-    if "size" in df.columns:
-        df["size_sqft_est"] = df["size"].map(extract_sqft_estimate)
+    size_candidates = ["size", "sqft", "square_feet", "square_footage", "built_up_area", "carpet_area", "area"]
+    for sc in size_candidates:
+        if sc not in df.columns:
+            continue
+        try:
+            df["size_sqft_est"] = _safe_sqft_series(df[sc])
+            break
+        except Exception:
+            continue
 
     if "price" in df.columns and "rental_income_potential" in df.columns:
         df["gross_rental_yield"] = (df["rental_income_potential"] * 12) / df["price"].replace(0, np.nan)
@@ -566,16 +599,25 @@ def knowledge_scores(
     if schema.price and schema.price in items.columns and prefs.min_price is not None and prefs.max_price is not None:
         price_col = items[schema.price]
         pfit, good = _range_fit(price_col, float(prefs.min_price), float(prefs.max_price), prefs.strict_budget)
-        w = 0.30
+        w = 0.28
         score += w * pfit
         reason_parts += np.where(good, "price-fit; ", "")
         total_weight += w
 
     if schema.bedrooms and schema.bedrooms in items.columns and prefs.min_beds is not None and prefs.max_beds is not None:
         bfit, good = _range_fit(items[schema.bedrooms], float(prefs.min_beds), float(prefs.max_beds), prefs.strict_beds)
-        w = 0.22
+        w = 0.20
         score += w * bfit
         reason_parts += np.where(good, "bedroom-fit; ", "")
+        total_weight += w
+
+    if "size_sqft_est" in items.columns and prefs.min_sqft is not None and prefs.max_sqft is not None:
+        afit, good = _range_fit(
+            items["size_sqft_est"], float(prefs.min_sqft), float(prefs.max_sqft), prefs.strict_area
+        )
+        w = 0.15
+        score += w * afit
+        reason_parts += np.where(good, "area-fit; ", "")
         total_weight += w
 
     if schema.location and schema.location in items.columns and prefs.cities:
@@ -1039,6 +1081,22 @@ def main():
                 help="Matches text in the listing type column (e.g. Apartment, Villa, BHK).",
             )
 
+        min_sqft_v = max_sqft_v = None
+        strict_area = False
+        if "size_sqft_est" in df.columns:
+            sq = pd.to_numeric(df["size_sqft_est"], errors="coerce").dropna()
+            if len(sq) >= 1:
+                smin = float(sq.quantile(0.05))
+                smax = float(sq.quantile(0.95))
+                if smin < smax and np.isfinite(smin) and np.isfinite(smax):
+                    st.caption("Area (estimated sq.ft from size text)")
+                    csa, csb = st.columns(2)
+                    with csa:
+                        min_sqft_v = st.number_input("Min sq.ft", min_value=0.0, max_value=float(smax * 3), value=smin, step=50.0)
+                    with csb:
+                        max_sqft_v = st.number_input("Max sq.ft", min_value=0.0, max_value=float(smax * 3), value=smax, step=50.0)
+                    strict_area = st.checkbox("Strict area range", value=False)
+
         ranking_candidates = [c for c in schema.numeric_cols if c not in {schema.item_id} and c in df.columns]
         if "size_sqft_est" in df.columns and "size_sqft_est" not in ranking_candidates:
             ranking_candidates = ["size_sqft_est"] + ranking_candidates
@@ -1066,8 +1124,11 @@ def main():
             cities=cities_sel,
             neighborhoods=nh_sel,
             property_types=types_sel,
+            min_sqft=min_sqft_v,
+            max_sqft=max_sqft_v,
             strict_budget=strict_budget,
             strict_beds=strict_beds,
+            strict_area=strict_area,
         )
 
         st.markdown("---")
@@ -1119,6 +1180,8 @@ def main():
                     prefs.min_price, prefs.max_price = prefs.max_price, prefs.min_price
                 if prefs.min_beds is not None and prefs.max_beds is not None and prefs.min_beds > prefs.max_beds:
                     prefs.min_beds, prefs.max_beds = prefs.max_beds, prefs.min_beds
+                if prefs.min_sqft is not None and prefs.max_sqft is not None and prefs.min_sqft > prefs.max_sqft:
+                    prefs.min_sqft, prefs.max_sqft = prefs.max_sqft, prefs.min_sqft
 
                 recs = run_recommender(
                     df=df,

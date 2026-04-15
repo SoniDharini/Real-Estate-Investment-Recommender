@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,10 @@ import plotly.graph_objects as go
 import streamlit as st
 
 warnings.filterwarnings("ignore")
+
+# Default dataset (same folder as this app) — used for Streamlit Cloud / local deployment.
+DATA_CSV = Path(__file__).resolve().parent / "data.csv"
+
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -121,17 +126,91 @@ class SchemaInfo:
     interaction: Optional[str]
     price: Optional[str]
     location: Optional[str]
+    neighborhood: Optional[str]
     category: Optional[str]
+    bedrooms: Optional[str]
+    size_col: Optional[str]
     text_cols: List[str]
     categorical_cols: List[str]
     numeric_cols: List[str]
     methods_available: Dict[str, bool]
 
 
+@dataclass
+class UserPreferences:
+    """Structured filters for knowledge-based property matching."""
+
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    min_beds: Optional[float] = None
+    max_beds: Optional[float] = None
+    cities: List[str] = field(default_factory=list)
+    neighborhoods: List[str] = field(default_factory=list)
+    property_types: List[str] = field(default_factory=list)
+    strict_budget: bool = True
+    strict_beds: bool = False
+
+
 def snake_case(col: str) -> str:
     col = str(col).strip().lower()
     col = re.sub(r"[^a-z0-9]+", "_", col)
     return re.sub(r"_+", "_", col).strip("_")
+
+
+def dedupe_column_names(cols: List[str]) -> List[str]:
+    """Ensure unique column names after snake_case (PyArrow / Streamlit cannot handle duplicates)."""
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for c in cols:
+        base = c or "column"
+        if base not in seen:
+            seen[base] = 0
+            out.append(base)
+        else:
+            seen[base] += 1
+            out.append(f"{base}_{seen[base]}")
+    return out
+
+
+def unique_ordered(cols: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for c in cols:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def arrow_safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicate column labels and ensure Arrow-serializable display."""
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    return df
+
+
+def choose_item_id_column(cols: List[str], excluded: Optional[List[str]] = None) -> Optional[str]:
+    excluded_set = set(excluded or [])
+    priority = [
+        "item_id",
+        "property_id",
+        "listing_id",
+        "listing_url",
+        "url",
+        "product_id",
+        "asset_id",
+        "house_id",
+        "state_id",
+    ]
+    for name in priority:
+        if name in cols and name not in excluded_set:
+            return name
+    for col in cols:
+        if col in excluded_set:
+            continue
+        if col == "id" or col.endswith("_id"):
+            return col
+    return None
 
 
 def text_clean(value: object) -> str:
@@ -158,6 +237,13 @@ def robust_read_csv(uploaded_file) -> pd.DataFrame:
             return pd.read_csv(uploaded_file, encoding="latin1")
         except Exception as ex:
             raise ValueError(f"Unable to parse CSV: {ex}") from ex
+
+
+def read_local_csv(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path)
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="latin1")
 
 
 def generate_synthetic_data(n_items: int = 80, n_users: int = 24) -> pd.DataFrame:
@@ -199,7 +285,7 @@ def generate_synthetic_data(n_items: int = 80, n_users: int = 24) -> pd.DataFram
 
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [snake_case(c) for c in df.columns]
+    df.columns = dedupe_column_names([snake_case(c) for c in df.columns])
     df = df.drop_duplicates().reset_index(drop=True)
 
     for col in df.columns:
@@ -228,6 +314,7 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def choose_col(cols: List[str], keywords: List[str], excluded: Optional[List[str]] = None) -> Optional[str]:
+    """Map logical roles to column names; exact matches first, then substring (guarded for short keywords)."""
     excluded = excluded or []
     for kw in keywords:
         for col in cols:
@@ -239,8 +326,13 @@ def choose_col(cols: List[str], keywords: List[str], excluded: Optional[List[str
         for col in cols:
             if col in excluded:
                 continue
-            if kw in col:
-                return col
+            if kw not in col:
+                continue
+            if kw == "id" and col != "id" and not col.endswith("_id"):
+                continue
+            if kw == "type" and col not in {"type", "property_type", "item_type", "listing_type"} and not col.endswith("_type"):
+                continue
+            return col
     return None
 
 
@@ -250,34 +342,76 @@ def infer_schema(df: pd.DataFrame) -> SchemaInfo:
     object_cols = df.select_dtypes(include=["object"]).columns.tolist()
 
     user_id = choose_col(cols, ["user_id", "userid", "customer_id", "client_id", "investor_id", "member_id"])
-    item_id = choose_col(
-        cols,
-        ["item_id", "property_id", "listing_id", "state_id", "product_id", "asset_id", "house_id", "id"],
-        excluded=[user_id] if user_id else [],
-    )
+    item_id = choose_item_id_column(cols, excluded=[user_id] if user_id else [])
     if item_id is None:
         item_id = "item_id"
         df[item_id] = np.arange(1, len(df) + 1)
 
+    neighborhood = choose_col(
+        cols,
+        ["neighborhood", "locality", "sector", "society", "suburb", "micro_market"],
+        excluded=[user_id, item_id] if user_id else [item_id],
+    )
+    location = choose_col(
+        cols,
+        ["city", "metro", "state_name", "state", "location", "region", "area"],
+        excluded=[x for x in [user_id, item_id, neighborhood] if x],
+    )
+
     item_name = choose_col(
         cols,
-        ["item_name", "state_name", "property_name", "listing_name", "name", "title", "state", "location", "city"],
+        ["listing_title", "item_name", "property_name", "listing_name", "title", "name"],
+        excluded=[x for x in [user_id, item_id] if x],
     )
     if item_name is None:
+        item_name = choose_col(
+            cols,
+            ["type", "property_type", "neighborhood", "city"],
+            excluded=[x for x in [user_id, item_id, location, neighborhood] if x],
+        )
+    if item_name is None:
         item_name = item_id
+    if item_name == location and neighborhood and item_name != neighborhood:
+        item_name = neighborhood
+    elif item_name == location:
+        alt = choose_col(cols, ["type", "property_type", "neighborhood", "url"], excluded=[location, user_id, item_id] if user_id else [location, item_id])
+        item_name = alt if alt else item_id
 
     rating = choose_col(cols, ["rating", "score", "preference_score", "satisfaction", "stars"])
-    interaction = choose_col(cols, ["interaction", "clicks", "purchases", "views", "bookmarks", "engagement"], excluded=[rating] if rating else [])
-    price = choose_col(cols, ["price", "cost", "amount", "budget", "value"])
-    location = choose_col(cols, ["state_name", "state", "location", "city", "region", "area"])
-    category = choose_col(cols, ["property_type", "item_type", "category", "segment", "tags", "type"])
+    interaction = choose_col(
+        cols,
+        ["interaction", "clicks", "purchases", "views", "bookmarks", "engagement"],
+        excluded=[rating] if rating else [],
+    )
+    price = choose_col(cols, ["price", "cost", "amount", "budget", "value", "rent", "monthly_rent"])
+    category = choose_col(
+        cols,
+        ["property_type", "item_type", "category", "segment", "tags", "type", "listing_type"],
+        excluded=[x for x in [user_id, item_id, item_name] if x],
+    )
+    bedrooms = choose_col(cols, ["beds", "bedrooms", "bhk", "bedroom", "no_of_bedrooms", "rooms"])
+    size_col = choose_col(cols, ["size", "sqft", "square_feet", "square_footage", "area", "built_up_area", "carpet_area"])
 
-    text_cols = [c for c in object_cols if c not in {item_name, location, category} and df[c].astype(str).str.len().mean() > 18]
-    categorical_cols = [c for c in object_cols if c not in text_cols and c not in {item_name}]
+    text_cols = [
+        c
+        for c in object_cols
+        if c not in {item_name, location, neighborhood, category, item_id}
+        and df[c].astype(str).str.len().mean() > 18
+    ]
+    categorical_cols = [
+        c for c in object_cols if c not in text_cols and c not in {item_name} and c != item_id
+    ]
 
     collab_possible = user_id is not None and item_id is not None and ((rating in numeric_cols) or interaction is not None)
     content_possible = len(categorical_cols) > 0 or len(text_cols) > 0 or len(numeric_cols) >= 2
-    knowledge_possible = (price is not None) or (category is not None) or (location is not None) or (len(numeric_cols) > 0)
+    knowledge_possible = (
+        (price is not None)
+        or (category is not None)
+        or (location is not None)
+        or (neighborhood is not None)
+        or (bedrooms is not None)
+        or (len(numeric_cols) > 0)
+    )
 
     return SchemaInfo(
         user_id=user_id,
@@ -287,7 +421,10 @@ def infer_schema(df: pd.DataFrame) -> SchemaInfo:
         interaction=interaction,
         price=price,
         location=location,
+        neighborhood=neighborhood,
         category=category,
+        bedrooms=bedrooms,
+        size_col=size_col,
         text_cols=text_cols[:4],
         categorical_cols=categorical_cols[:8],
         numeric_cols=numeric_cols,
@@ -299,8 +436,32 @@ def infer_schema(df: pd.DataFrame) -> SchemaInfo:
     )
 
 
+def extract_sqft_estimate(val: object) -> float:
+    """Parse strings like '1085 sqft', '799-1258 sqft' into a single numeric estimate."""
+    if pd.isna(val):
+        return np.nan
+    s = str(val).lower().replace(",", "")
+    nums = re.findall(r"[\d.]+", s)
+    if not nums:
+        return np.nan
+    floats = [float(x) for x in nums]
+    return float(np.median(floats))
+
+
 def engineer_real_estate_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    if "type" in df.columns and "neighborhood" in df.columns:
+        df["listing_title"] = (
+            df["type"].astype(str).str.strip() + " — " + df["neighborhood"].astype(str).str.strip()
+        )
+    elif "type" in df.columns and "city" in df.columns:
+        df["listing_title"] = df["type"].astype(str).str.strip() + " — " + df["city"].astype(str).str.strip()
+    elif "url" in df.columns:
+        df["listing_title"] = df["url"].astype(str).str.slice(0, 96)
+
+    if "size" in df.columns:
+        df["size_sqft_est"] = df["size"].map(extract_sqft_estimate)
+
     if "price" in df.columns and "rental_income_potential" in df.columns:
         df["gross_rental_yield"] = (df["rental_income_potential"] * 12) / df["price"].replace(0, np.nan)
     if "price" in df.columns and "cap_rate" not in df.columns and "gross_rental_yield" in df.columns:
@@ -353,50 +514,104 @@ def minmax(series: pd.Series) -> pd.Series:
     return (s - s.min()) / denom
 
 
+def _range_fit(series: pd.Series, lo: float, hi: float, strict: bool) -> Tuple[pd.Series, pd.Series]:
+    """Return (fit 0-1, soft reason mask) for numeric preference range."""
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    if strict:
+        inside = ((s >= lo) & (s <= hi)).astype(float)
+        return inside, inside > 0
+    mid = (lo + hi) / 2.0
+    half = max((hi - lo) / 2.0, 1e-6)
+    dist = (s - mid).abs()
+    fit = (1.0 - (dist / (half + 1e-6)).clip(0, 1)).fillna(0.0)
+    return fit, fit > 0.35
+
+
+def _property_type_match(series: pd.Series, selected: List[str]) -> pd.Series:
+    """Fuzzy match listing type strings against user-selected labels (e.g. 'Villa', 'BHK Apartment')."""
+    if not selected:
+        return pd.Series(0.0, index=series.index)
+    sel = [text_clean(s) for s in selected if s]
+    out = pd.Series(0.0, index=series.index)
+    for idx, raw in series.items():
+        t = text_clean(raw)
+        if not t:
+            continue
+        best = 0.0
+        for lab in sel:
+            if not lab:
+                continue
+            if lab in t or t in lab:
+                best = 1.0
+                break
+            lt, tt = tokenize(lab), tokenize(t)
+            if lt and tt:
+                inter = len(lt & tt)
+                union = len(lt | tt) or 1
+                best = max(best, inter / union)
+        out.loc[idx] = best
+    return out
+
+
 def knowledge_scores(
     items: pd.DataFrame,
     schema: SchemaInfo,
-    max_budget: Optional[float],
-    pref_locations: List[str],
-    pref_categories: List[str],
+    prefs: UserPreferences,
     ranking_col: Optional[str],
 ) -> Tuple[pd.Series, pd.Series]:
     score = pd.Series(0.0, index=items.index)
     reason_parts = pd.Series("", index=items.index)
     total_weight = 0.0
 
-    if schema.price and schema.price in items.columns and max_budget is not None:
-        price_col = items[schema.price].astype(float)
-        budget_fit = np.where(price_col <= max_budget, 1 - (price_col / max_budget).clip(0, 1), 0)
-        budget_fit = pd.Series(budget_fit, index=items.index)
-        score += 0.35 * budget_fit
-        reason_parts += np.where(budget_fit > 0.3, "budget-fit; ", "")
-        total_weight += 0.35
+    if schema.price and schema.price in items.columns and prefs.min_price is not None and prefs.max_price is not None:
+        price_col = items[schema.price]
+        pfit, good = _range_fit(price_col, float(prefs.min_price), float(prefs.max_price), prefs.strict_budget)
+        w = 0.30
+        score += w * pfit
+        reason_parts += np.where(good, "price-fit; ", "")
+        total_weight += w
 
-    if schema.location and schema.location in items.columns and pref_locations:
-        loc_match = items[schema.location].astype(str).isin(pref_locations).astype(float)
-        score += 0.25 * loc_match
-        reason_parts += np.where(loc_match > 0, "preferred-location; ", "")
-        total_weight += 0.25
+    if schema.bedrooms and schema.bedrooms in items.columns and prefs.min_beds is not None and prefs.max_beds is not None:
+        bfit, good = _range_fit(items[schema.bedrooms], float(prefs.min_beds), float(prefs.max_beds), prefs.strict_beds)
+        w = 0.22
+        score += w * bfit
+        reason_parts += np.where(good, "bedroom-fit; ", "")
+        total_weight += w
 
-    if schema.category and schema.category in items.columns and pref_categories:
-        cat_match = items[schema.category].astype(str).isin(pref_categories).astype(float)
-        score += 0.25 * cat_match
-        reason_parts += np.where(cat_match > 0, "preferred-category; ", "")
-        total_weight += 0.25
+    if schema.location and schema.location in items.columns and prefs.cities:
+        loc_match = items[schema.location].astype(str).isin(prefs.cities).astype(float)
+        w = 0.18
+        score += w * loc_match
+        reason_parts += np.where(loc_match > 0, "city-match; ", "")
+        total_weight += w
+
+    if schema.neighborhood and schema.neighborhood in items.columns and prefs.neighborhoods:
+        nh_match = items[schema.neighborhood].astype(str).isin(prefs.neighborhoods).astype(float)
+        w = 0.15
+        score += w * nh_match
+        reason_parts += np.where(nh_match > 0, "neighborhood-match; ", "")
+        total_weight += w
+
+    if schema.category and schema.category in items.columns and prefs.property_types:
+        tmatch = _property_type_match(items[schema.category], prefs.property_types)
+        w = 0.25
+        score += w * tmatch
+        reason_parts += np.where(tmatch > 0.55, "property-type-match; ", "")
+        total_weight += w
 
     if ranking_col and ranking_col in items.columns and pd.api.types.is_numeric_dtype(items[ranking_col]):
         quality = minmax(items[ranking_col])
-        score += 0.15 * quality
+        w = 0.10
+        score += w * quality
         reason_parts += np.where(quality > 0.7, f"high-{ranking_col}; ", "")
-        total_weight += 0.15
+        total_weight += w
 
     if total_weight == 0:
         return pd.Series(0.5, index=items.index), pd.Series("baseline-ranking", index=items.index)
 
     final = (score / total_weight).clip(0, 1)
     reasons = reason_parts.str.strip().str.rstrip(";")
-    reasons = reasons.replace("", "rules-and-metadata-match")
+    reasons = reasons.replace("", "preference-match")
     return final, reasons
 
 
@@ -526,6 +741,9 @@ def select_effective_method(method_choice: str, schema: SchemaInfo) -> str:
     count = sum(1 for v in available.values() if v)
 
     if method_choice == "Auto":
+        # Listing-only property CSVs (no user–item interactions): knowledge filters + optional content anchor.
+        if available["knowledge"] and not available["collaborative"]:
+            return "Knowledge-Based"
         if count >= 2:
             return "Hybrid"
         if available["collaborative"]:
@@ -551,16 +769,14 @@ def run_recommender(
     schema: SchemaInfo,
     method: str,
     top_n: int,
-    max_budget: Optional[float],
-    pref_locations: List[str],
-    pref_categories: List[str],
+    prefs: UserPreferences,
     ranking_col: Optional[str],
     anchor_item_id: Optional[str],
     target_user: Optional[str],
 ) -> pd.DataFrame:
     items = build_item_catalog(df, schema).copy()
 
-    k_score, k_reason = knowledge_scores(items, schema, max_budget, pref_locations, pref_categories, ranking_col)
+    k_score, k_reason = knowledge_scores(items, schema, prefs, ranking_col)
     c_score, c_reason = content_scores(items, schema, anchor_item_id)
     cf_score, cf_reason = collaborative_scores(df, items, schema, target_user)
 
@@ -572,7 +788,6 @@ def run_recommender(
     elif method == "Collaborative":
         weights["collab"] = 1.0
     else:
-        # Hybrid: adaptive weighting by available methods.
         availability = schema.methods_available
         if availability["knowledge"]:
             weights["knowledge"] = 0.35
@@ -606,16 +821,8 @@ def run_recommender(
         reason.append("; ".join([p for p in parts if p]) if parts else "ranked-by-combined-signal")
     items["explanation"] = reason
 
-    if schema.price and max_budget is not None and schema.price in items.columns:
-        items = items[items[schema.price] <= max_budget]
-
-    if schema.location and pref_locations and schema.location in items.columns:
-        items = items[items[schema.location].astype(str).isin(pref_locations)]
-
-    if schema.category and pref_categories and schema.category in items.columns:
-        items = items[items[schema.category].astype(str).isin(pref_categories)]
-
-    return items.sort_values("match_score", ascending=False).head(top_n).reset_index(drop=True)
+    ranked = items.sort_values("match_score", ascending=False)
+    return ranked.head(top_n).reset_index(drop=True)
 
 
 def plottable_numeric_columns(df: pd.DataFrame, cols: List[str], min_valid: int = 2) -> List[str]:
@@ -700,8 +907,10 @@ def fig_scatter(df: pd.DataFrame, x: str, y: str, color: Optional[str], title: s
 
 def fig_reco_bar(recs: pd.DataFrame, schema: SchemaInfo):
     y_col = schema.item_name if schema.item_name in recs.columns else schema.item_id
+    plot_df = recs.sort_values("match_score", ascending=True).copy()
+    plot_df[y_col] = plot_df[y_col].astype(str).str.slice(0, 100)
     fig = px.bar(
-        recs.sort_values("match_score", ascending=True),
+        plot_df,
         x="match_score",
         y=y_col,
         orientation="h",
@@ -731,17 +940,23 @@ def main():
     )
 
     with st.sidebar:
-        st.markdown("### 📂 Data Source")
-        uploaded = st.file_uploader("Upload CSV dataset", type=["csv"])
-        use_demo = st.toggle("Use demo dataset", value=uploaded is None)
+        st.markdown("### Data source")
+        uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
+        if uploaded is not None:
+            use_uploaded = st.toggle("Use uploaded CSV instead of data.csv", value=True)
+        else:
+            use_uploaded = False
 
         try:
-            if uploaded is not None and not use_demo:
+            if uploaded is not None and use_uploaded:
                 df_raw = robust_read_csv(uploaded)
-                data_note = f"Uploaded dataset loaded: {len(df_raw):,} rows."
+                data_note = f"Uploaded dataset: {len(df_raw):,} rows."
+            elif DATA_CSV.exists():
+                df_raw = read_local_csv(DATA_CSV)
+                data_note = f"Loaded `{DATA_CSV.name}`: {len(df_raw):,} rows."
             else:
                 df_raw = generate_synthetic_data()
-                data_note = "Using synthetic demo data (collaborative + content-ready)."
+                data_note = "Using synthetic demo data (place `data.csv` next to the app for production data)."
         except Exception as ex:
             st.error(str(ex))
             return
@@ -752,47 +967,90 @@ def main():
 
         st.success(data_note)
         st.markdown("---")
-        st.markdown("### ⚙️ Recommendation Setup")
+        st.markdown("### Your property preferences")
 
         method_choice = st.selectbox(
-            "Recommendation Strategy",
+            "Recommendation strategy",
             ["Auto", "Hybrid", "Knowledge-Based", "Content-Based", "Collaborative"],
-            help="Auto selects the best method(s) based on uploaded schema and signal quality.",
+            help="Auto uses knowledge-based ranking for listing-only datasets (typical property CSVs).",
         )
         effective_method = select_effective_method(method_choice, schema)
 
-        top_n = st.slider("Top-N recommendations", min_value=3, max_value=50, value=12)
+        top_n = st.slider("How many listings to show", min_value=3, max_value=50, value=12)
 
         price_col = schema.price if schema.price in df.columns else None
-        max_budget = None
+        min_price_v = max_price_v = None
         if price_col:
-            max_budget = st.slider(
-                "Maximum budget",
-                min_value=float(df[price_col].min()),
-                max_value=float(df[price_col].max()),
-                value=float(df[price_col].quantile(0.8)),
-            )
+            pser = pd.to_numeric(df[price_col], errors="coerce")
+            if pser.notna().sum() == 0:
+                price_col = None
+        if price_col:
+            pmin = float(pser.min())
+            pmax = float(pser.max())
+            if not np.isfinite(pmin) or not np.isfinite(pmax) or pmin >= pmax:
+                price_col = None
+        if price_col:
+            mid_low = float(pser.quantile(0.15))
+            mid_high = float(pser.quantile(0.85))
+            st.caption("Budget (price range)")
+            cpa, cpb = st.columns(2)
+            with cpa:
+                min_price_v = st.number_input("Min price", min_value=pmin, max_value=pmax, value=mid_low, format="%.0f")
+            with cpb:
+                max_price_v = st.number_input("Max price", min_value=pmin, max_value=pmax, value=mid_high, format="%.0f")
+            strict_budget = st.checkbox("Strict budget (exclude listings fully outside range)", value=False)
 
-        pref_locations: List[str] = []
+        else:
+            strict_budget = False
+
+        min_beds_v = max_beds_v = None
+        if schema.bedrooms and schema.bedrooms in df.columns:
+            b = pd.to_numeric(df[schema.bedrooms], errors="coerce").dropna()
+            if len(b):
+                bmin, bmax = float(b.min()), float(b.max())
+                st.caption("Bedrooms (BHK)")
+                cba, cbb = st.columns(2)
+                with cba:
+                    min_beds_v = st.number_input("Min beds", min_value=bmin, max_value=bmax, value=bmin)
+                with cbb:
+                    max_beds_v = st.number_input("Max beds", min_value=bmin, max_value=bmax, value=bmax)
+                strict_beds = st.checkbox("Strict bedroom count", value=False)
+            else:
+                strict_beds = False
+        else:
+            strict_beds = False
+
+        cities_sel: List[str] = []
         if schema.location and schema.location in df.columns:
             loc_options = sorted(df[schema.location].astype(str).unique().tolist())
-            pref_locations = st.multiselect("Preferred locations/states", loc_options)
+            cities_sel = st.multiselect("City / region (optional)", loc_options)
 
-        pref_categories: List[str] = []
+        nh_sel: List[str] = []
+        if schema.neighborhood and schema.neighborhood in df.columns:
+            nh_options = sorted(df[schema.neighborhood].astype(str).unique().tolist())
+            nh_sel = st.multiselect("Neighborhood / locality (optional)", nh_options)
+
+        types_sel: List[str] = []
         if schema.category and schema.category in df.columns:
-            cat_options = sorted(df[schema.category].astype(str).unique().tolist())
-            pref_categories = st.multiselect("Preferred categories/types", cat_options)
+            type_options = sorted(df[schema.category].astype(str).unique().tolist())
+            types_sel = st.multiselect(
+                "Property type / listing label (optional, partial match)",
+                type_options,
+                help="Matches text in the listing type column (e.g. Apartment, Villa, BHK).",
+            )
 
-        ranking_candidates = [c for c in schema.numeric_cols if c != schema.item_id]
-        ranking_col = st.selectbox("Primary ranking metric", ranking_candidates) if ranking_candidates else None
+        ranking_candidates = [c for c in schema.numeric_cols if c not in {schema.item_id} and c in df.columns]
+        if "size_sqft_est" in df.columns and "size_sqft_est" not in ranking_candidates:
+            ranking_candidates = ["size_sqft_est"] + ranking_candidates
+        ranking_col = st.selectbox("Extra ranking emphasis (optional numeric)", ranking_candidates) if ranking_candidates else None
 
         anchor_item_id = None
         if schema.methods_available["content"]:
             item_options = df[schema.item_id].astype(str).dropna().unique().tolist()
             anchor_item_id = st.selectbox(
-                "Reference item for content similarity",
+                "Similar to listing (optional — content-based)",
                 options=[None] + item_options[:500],
-                format_func=lambda x: "None (global similarity baseline)" if x is None else str(x),
+                format_func=lambda x: "None (preference-only)" if x is None else str(x)[:72],
             )
 
         target_user = None
@@ -800,8 +1058,20 @@ def main():
             user_options = df[schema.user_id].astype(str).dropna().unique().tolist()
             target_user = st.selectbox("Target user ID", options=user_options)
 
+        prefs = UserPreferences(
+            min_price=min_price_v,
+            max_price=max_price_v,
+            min_beds=min_beds_v,
+            max_beds=max_beds_v,
+            cities=cities_sel,
+            neighborhoods=nh_sel,
+            property_types=types_sel,
+            strict_budget=strict_budget,
+            strict_beds=strict_beds,
+        )
+
         st.markdown("---")
-        run = st.button("🔍 Generate Recommendations", use_container_width=True)
+        run = st.button("Generate recommendations", use_container_width=True)
 
     available_text = ", ".join([k for k, v in schema.methods_available.items() if v]) or "none"
     c1, c2, c3, c4 = st.columns(4)
@@ -826,66 +1096,87 @@ def main():
                 "detected_rating": schema.rating,
                 "detected_interaction": schema.interaction,
                 "detected_price": schema.price,
+                "detected_bedrooms": schema.bedrooms,
                 "detected_location": schema.location,
+                "detected_neighborhood": schema.neighborhood,
                 "detected_category": schema.category,
+                "detected_size": schema.size_col,
                 "text_features": schema.text_cols,
                 "numeric_features_count": len(schema.numeric_cols),
                 "categorical_features_count": len(schema.categorical_cols),
                 "selected_method": effective_method,
             }
         )
-        st.dataframe(df.head(20), use_container_width=True)
+        st.dataframe(arrow_safe_dataframe(df.head(20)), use_container_width=True)
 
     with tab2:
         st.markdown('<div class="section-title">Recommendation Results</div>', unsafe_allow_html=True)
         if not run:
-            st.info("Configure preferences in the sidebar and click Generate Recommendations.")
+            st.info("Set your budget, bedrooms, and optional filters in the sidebar, then generate recommendations.")
         else:
-            recs = run_recommender(
-                df=df,
-                schema=schema,
-                method=effective_method,
-                top_n=top_n,
-                max_budget=max_budget,
-                pref_locations=pref_locations,
-                pref_categories=pref_categories,
-                ranking_col=ranking_col,
-                anchor_item_id=anchor_item_id,
-                target_user=target_user,
-            )
-            if recs.empty:
-                st.warning("No recommendations found with the selected constraints. Relax filters and retry.")
-            else:
-                st.success(f"{len(recs)} recommendations generated using `{effective_method}`.")
-                st.caption(
-                    "Scoring combines knowledge, content, and collaborative signals with adaptive weights "
-                    "based on available schema fields and data quality."
-                )
-                st.plotly_chart(fig_reco_bar(recs, schema), use_container_width=True)
+            try:
+                if prefs.min_price is not None and prefs.max_price is not None and prefs.min_price > prefs.max_price:
+                    prefs.min_price, prefs.max_price = prefs.max_price, prefs.min_price
+                if prefs.min_beds is not None and prefs.max_beds is not None and prefs.min_beds > prefs.max_beds:
+                    prefs.min_beds, prefs.max_beds = prefs.max_beds, prefs.min_beds
 
-                display_cols = [
-                    c
-                    for c in [
-                        schema.item_id,
-                        schema.item_name,
-                        schema.location,
-                        schema.category,
-                        schema.price,
-                        "match_score",
-                        "knowledge_score",
-                        "content_score",
-                        "collab_score",
-                        "explanation",
+                recs = run_recommender(
+                    df=df,
+                    schema=schema,
+                    method=effective_method,
+                    top_n=top_n,
+                    prefs=prefs,
+                    ranking_col=ranking_col,
+                    anchor_item_id=anchor_item_id,
+                    target_user=target_user,
+                )
+            except Exception as ex:
+                st.error(f"Recommendation step failed: {ex}")
+                recs = pd.DataFrame()
+
+            if recs.empty:
+                st.warning("No recommendations available. Widen your price or bedroom range or clear optional filters.")
+            else:
+                st.success(f"{len(recs)} listings ranked with `{effective_method}`. Match % is higher when more preferences align.")
+                st.caption(
+                    "Knowledge scores reflect your filters (budget, beds, city, neighborhood, listing type). "
+                    "Content/collaborative signals apply when you choose a reference listing or user data exists."
+                )
+                try:
+                    st.plotly_chart(fig_reco_bar(recs, schema), use_container_width=True)
+                except Exception as chart_ex:
+                    st.caption(f"Chart skipped: {chart_ex}")
+
+                display_cols = unique_ordered(
+                    [
+                        c
+                        for c in [
+                            schema.item_name,
+                            schema.item_id,
+                            schema.category,
+                            schema.bedrooms,
+                            schema.price,
+                            schema.size_col,
+                            "size_sqft_est",
+                            schema.location,
+                            schema.neighborhood,
+                            "match_score",
+                            "knowledge_score",
+                            "content_score",
+                            "collab_score",
+                            "explanation",
+                        ]
+                        if c and c in recs.columns
                     ]
-                    if c and c in recs.columns
-                ]
+                )
                 out = recs[display_cols].copy()
                 if schema.price and schema.price in out.columns:
-                    out[schema.price] = out[schema.price].map(lambda x: f"${x:,.0f}" if pd.notna(x) else x)
-                out["match_score"] = out["match_score"].map(lambda x: f"{x:.2f}")
-                st.dataframe(out, use_container_width=True)
+                    out[schema.price] = out[schema.price].map(lambda x: f"₹{x:,.0f}" if pd.notna(x) else x)
+                if "match_score" in out.columns:
+                    out["match_score"] = out["match_score"].map(lambda x: f"{x:.1f}%")
+                st.dataframe(arrow_safe_dataframe(out), use_container_width=True)
                 st.download_button(
-                    "⬇️ Export Recommendations as CSV",
+                    "Export recommendations as CSV",
                     data=recs.to_csv(index=False).encode("utf-8"),
                     file_name="recommendations.csv",
                     mime="text/csv",
@@ -925,7 +1216,7 @@ def main():
 
     with tab4:
         st.markdown('<div class="section-title">Full Processed Dataset</div>', unsafe_allow_html=True)
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(arrow_safe_dataframe(df), use_container_width=True)
         st.download_button(
             "⬇️ Download Processed Dataset",
             data=df.to_csv(index=False).encode("utf-8"),
